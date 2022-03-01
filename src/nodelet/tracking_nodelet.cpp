@@ -86,18 +86,18 @@ class TrackingNodelet : public opencv_apps::Nodelet
   image_transport::Subscriber img_sub_;
   image_transport::CameraSubscriber cam_sub_;
   ros::Publisher msg_pub_;
-  ros::ServiceServer roi_srv_;
+  ros::ServiceServer add_roi_srv_, set_roi_srv_;
 
   boost::shared_ptr<image_transport::ImageTransport> it_;
 
   boost::mutex mutex_;
   int tracking_algorithm_;
 
-  cv::Ptr<cv::Tracker> tracker_;
+  cv::Ptr<MultiTracker> trackers_;
 #if (CV_VERSION_MAJOR >= 4 && CV_VERSION_MINOR >= 5)
 #define Rect2d Rect
 #endif
-  cv::Rect2d roi_;
+  std::vector<cv::Rect2d> rois_;
 
 public:
   static cv::Mat frame_;
@@ -162,14 +162,16 @@ public:
           selectorParams.box.y += selectorParams.box.height;
           selectorParams.box.height *= -1;
         }
-        initializeTracker(tracking_algorithm_, selectorParams.box);
+        // When select ROI on image veiw, add new tracker.
+        // To clear the multi-tracker, press 'c'
+        addTracker(tracking_algorithm_, selectorParams.box);
         break;
     }
   }
   // save the keypressed character
   cv::Size imageSize;
 
-  bool setROICb(opencv_apps::SetImages::Request& request, opencv_apps::SetImages::Response& response)
+  bool addROI(opencv_apps::SetImages::Request& request, opencv_apps::SetImages::Response& response, bool clear = false)
   {
     if (frame_.empty() && request.images.empty())
     {
@@ -179,29 +181,37 @@ public:
       ROS_ERROR_STREAM(response.error);
       return true;
     }
-    if (request.rects.size() != 1)
+    if ( clear )
     {
-      response.ok = false;
-      response.error = "tracking_nodelet does not supoprt multiple ROI's";
-      ROS_ERROR_STREAM(response.error);
+      trackers_ = trackers_->create();
     }
-    else
+    for (size_t i = 0; i < request.rects.size(); i++ )
     {
-      cv::Rect2d roi(request.rects[0].x - request.rects[0].width / 2, request.rects[0].y - request.rects[0].height / 2,
-                     request.rects[0].width, request.rects[0].height);
-      if (!request.images.empty())
+      cv::Rect2d roi(request.rects[i].x - request.rects[i].width / 2, request.rects[i].y - request.rects[i].height / 2,
+                     request.rects[i].width, request.rects[i].height);
+      if (request.images.size() >= i)
       {
-        sensor_msgs::Image img_msg = request.images[0];
+        sensor_msgs::Image img_msg = request.images[i];
         cv::Mat frame = cv_bridge::toCvCopy(img_msg, sensor_msgs::image_encodings::BGR8)->image;
-        initializeTracker(tracking_algorithm_, roi, frame);
+        addTracker(tracking_algorithm_, roi, frame);
       }
       else
       {
-        initializeTracker(tracking_algorithm_, roi);
+        addTracker(tracking_algorithm_, roi);
       }
       response.ok = true;
     }
     return true;
+  }
+
+  bool addROICb(opencv_apps::SetImages::Request& request, opencv_apps::SetImages::Response& response)
+  {
+    return addROI(request, response, false); // add trackers
+  }
+
+  bool setROICb(opencv_apps::SetImages::Request& request, opencv_apps::SetImages::Response& response)
+  {
+    return addROI(request, response, true); // clear and add trackers
   }
 
   void imageCallbackWithInfo(const sensor_msgs::ImageConstPtr& msg, const sensor_msgs::CameraInfoConstPtr& cam_info)
@@ -232,45 +242,56 @@ public:
 
   void reconfigureCallback(Config& config, uint32_t level)
   {
+    ROS_INFO_STREAM("reconfigure");
     boost::mutex::scoped_lock lock(mutex_);
     config_ = config;
+    // when algorithm on reconfigure gui, update all trackers
     tracking_algorithm_ = config.tracking_algorithm;
-    initializeTracker(tracking_algorithm_, roi_);
+    initializeTracker();
   }
 
-  void initializeTracker(int tracking_algorithm, const cv::Rect& roi, const cv::Mat& frame = frame_)
+  void initializeTracker(const cv::Mat& frame = frame_)
+  {
+    trackers_ = trackers_->create();
+    for(size_t i = 0; i < rois_.size(); i++){
+      addTracker(tracking_algorithm_, rois_[i], frame);
+    }
+  }
+
+  void addTracker(int tracking_algorithm, const cv::Rect& roi, const cv::Mat& frame = frame_)
   {
     if (roi.empty())
     {
       return;
     }
+    cv::Ptr<cv::Tracker> tracker;
     switch (tracking_algorithm)
     {
       case opencv_apps::Tracking_MIL:
-        tracker_ = cv::TrackerMIL::create();
+        tracker = cv::TrackerMIL::create();
         ROS_INFO("Create MIL (Multiple Instance Learning) tracker");
         break;
       case opencv_apps::Tracking_BOOSTING:
-        tracker_ = TrackingAPI(TrackerBoosting::create());
+        tracker = TrackingAPI(TrackerBoosting::create());
         ROS_INFO("Create On-line version of the AdaBoost tracker");
         break;
       case opencv_apps::Tracking_MEDIANFLOW:
-        tracker_ = TrackingAPI(TrackerMedianFlow::create());
+        tracker = TrackingAPI(TrackerMedianFlow::create());
         ROS_INFO("Create Median Flow tracker");
         break;
       case opencv_apps::Tracking_TLD:
-        tracker_ = TrackingAPI(TrackerTLD::create());
+        tracker = TrackingAPI(TrackerTLD::create());
         ROS_INFO("Create TLD (Tracking, learning and detection) tracker");
         break;
       case opencv_apps::Tracking_KCF:
-        tracker_ = cv::TrackerKCF::create();
+        tracker = cv::TrackerKCF::create();
         ROS_INFO("Create KCF (Kernelized Correlation Filter) tracker");
         break;
       case opencv_apps::Tracking_GOTURN:
         if (boost::filesystem::exists("goturn.caffemodel") && boost::filesystem::exists("goturn.prototxt"))
         {
           boost::filesystem::exists("goturn.caffemodel");
-          tracker_ = cv::TrackerGOTURN::create();
+          tracker = cv::TrackerGOTURN::create();
           ROS_INFO("Create GOTURN (Generic Object Tracking Using Regression Networks) tracker");
         }
         //catch (boost::system::error_code& e) {
@@ -289,14 +310,14 @@ public:
         }
         break;
       case opencv_apps::Tracking_MOSSE:
-        tracker_ = TrackingAPI(TrackerMOSSE::create());
+        tracker = TrackingAPI(TrackerMOSSE::create());
         ROS_INFO("Create MOSSE (Minimum Output Sum of Squared Error) tracker");
         break;
     }
+
     ROS_INFO_STREAM("       on ROI (center-x: " << roi.x + roi.width / 2 << ", center-y: " << roi.y + roi.height / 2
                                                 << ", width: " << roi.width << ", height: " << roi.height << ")");
-    tracker_->init(frame, roi);
-    roi_ = roi;
+    trackers_->add(tracker, frame, roi);
   }
 
   void doWork(const sensor_msgs::Image::ConstPtr& image_msg, const std::string& input_frame_from_msg)
@@ -305,20 +326,15 @@ public:
     {
       frame_ = cv_bridge::toCvShare(image_msg, sensor_msgs::image_encodings::BGR8)->image;
 
-      // do not track if ROI was not selected
-      bool retval = false;
-      if (roi_.empty())
-      {
-        ROS_WARN_THROTTLE(3, "ROI is not defined, please set via GUI or /set_roi message interface");
-      }
-      else
-      {
-        /// Tracking
-        boost::mutex::scoped_lock lock(mutex_);
-        retval = tracker_->update(frame_, roi_);
+      /// Tracking
+      boost::mutex::scoped_lock lock(mutex_);
+      bool r = trackers_->update(frame_, rois_);
 
-        // keep roi within image
-        roi_ = roi_ & cv::Rect2d(cv::Point(0, 0), frame_.size());
+      // keep roi within image
+      for(size_t i = 0; i < rois_.size(); i++)
+      {
+        ROS_INFO_STREAM(r << " " << i << " " << rois_[i]);
+        rois_[i] = rois_[i] & cv::Rect2d(cv::Point(0, 0), frame_.size());
       }
 
       /// Messages
@@ -338,21 +354,27 @@ public:
         {
           cv::rectangle(result_image, selectorParams.box, cv::Scalar(0, 0, 255), 2, 1);
         }
-        if (!roi_.empty())
+        if (rois_.size() >= 1)
         {
-          cv::rectangle(result_image, roi_, retval ? cv::Scalar(255, 0, 0) : cv::Scalar(127, 32, 32), retval ? 2 : 1, 1);
-          output_msg.rects.resize(1);
-          // publish x, y as center of target
-          output_msg.rects[0].x = roi_.x + roi_.width / 2;
-          output_msg.rects[0].y = roi_.y + roi_.height / 2;
-          output_msg.rects[0].width = roi_.width;
-          output_msg.rects[0].height = roi_.height;
+          output_msg.rects.resize(rois_.size());
+          for(size_t i = 0; i < rois_.size(); i++)
+          {
+            cv::Rect2d roi = rois_[i];
+            bool retval = roi.empty();
+            cv::rectangle(result_image, roi, retval ? cv::Scalar(255, 0, 0) : cv::Scalar(127, 32, 32), retval ? 2 : 1, 1);
+            // publish x, y as center of target
+            output_msg.rects[i].x = roi.x + roi.width / 2;
+            output_msg.rects[i].y = roi.y + roi.height / 2;
+            output_msg.rects[i].width = roi.width;
+            output_msg.rects[i].height = roi.height;
+          }
         }
         cv::imshow(window_name_, result_image);
         int c = cv::waitKey(1);
         if (c == 'c' || c == 'C')  // cancel selection
         {
-          roi_ = cv::Rect();
+          trackers_ = trackers_->create();
+          rois_.clear();
         }
       }
 
@@ -361,7 +383,7 @@ public:
           cv_bridge::CvImage(image_msg->header, sensor_msgs::image_encodings::BGR8, result_image).toImageMsg());
 
       // publish only when ROI is defiend
-      if (!roi_.empty())
+      if (rois_.size() >= 1)
       {
         msg_pub_.publish(output_msg);
       }
@@ -396,7 +418,8 @@ public:
 
     img_pub_ = advertiseImage(*pnh_, "image", 1);
     msg_pub_ = advertise<opencv_apps::RectArrayStamped>(*pnh_, "output", 1);
-    roi_srv_ = pnh_->advertiseService("set_roi", &TrackingNodelet::setROICb, this);
+    add_roi_srv_ = pnh_->advertiseService("add_roi", &TrackingNodelet::addROICb, this);
+    set_roi_srv_ = pnh_->advertiseService("set_roi", &TrackingNodelet::setROICb, this);
     onInitPostProcess();
   }
 };
